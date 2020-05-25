@@ -3,7 +3,18 @@
 #include <errno.h>
 #include <unistd.h>
 #include <limits.h>
+#include <fcntl.h>
 #include "util.h"
+
+int 
+set_non_block(int sock) {
+    int opts = fcntl(sock, F_GETFL) | O_NONBLOCK;
+    if (fcntl(sock, F_SETFL, opts) < 0) {
+        perror("fcntl(sock,SETFL,opts)");
+        return -1;
+    }
+    return 0;
+}
 
 void 
 error_exit(const char *str) {

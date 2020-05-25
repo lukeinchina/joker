@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+int set_non_block(int sock);
 void error_exit(const char *str);
 
 ssize_t readn(int fd, void *vptr, size_t n);

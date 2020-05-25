@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <errno.h>
 #include <ctype.h>
 #include <assert.h>
 #include <pthread.h>
@@ -15,22 +16,22 @@
 
 #define HTTP_SERVER "Server: httpd 0.1.0\r\n"
 
-enum {
-    METHOD_GET = 1,
-    METHOD_POST = 2
-};
-
 /*--------------------------------------------------------------------*/
 int serv_socket(uint16_t port);
 int bad_client(int cli_fd);
 void usage(const char *prog);
 void undefined_method(int cli_fd);
+void bad_request(int cli_fd);
 void not_find(int cli_fd);
+int internal_server_error(int cli_fd); /* 500 */
+int cgi_exec_failed(int cli_fd);
+int send_headers(int cli_fd); /* http head: 200 */
 
+int read_all(int sockfd, char *buff, size_t size);
 int discard_left(int cli_fd, char *buff, size_t size);
 
 int send_file(int cli_fd, const char *path);
-int exec_cgi(int cli_fd, const char *path, const char *query);
+int exec_cgi(int cli_fd, const char *path, const char *query, const char *method);
 
 int handle_get(int cli_fd, const char *uri);
 int handle_post(int cli_fd, const char *uri);
@@ -100,13 +101,90 @@ int serv_socket(uint16_t port) {
  */
 int 
 handle_post(int cli_fd, const char *path) {
-    ;
+    int n, length;
+    char buff[4096];
+    const char *query = NULL;
+    while((n = readline(cli_fd, buff, sizeof(buff))) > 0) {
+        printf("%s", buff); /* debug */
+        if (0 == strcmp(buff, "\r\n")) {
+            break;
+        } else if (0 == strcasecmp(buff, "content-length:")) {
+            /* HTTP1.0中这个字段可有可无 */
+            length = atoi(buff + 15);
+            printf("atoi:%d\n", length);
+        }
+    }
+    if (n <= 0) {
+        bad_request(cli_fd);
+        close(cli_fd);
+        return -1;
+    }
+    n = read(cli_fd, buff, sizeof(buff));
+    if (n < 0) {
+        close(cli_fd);
+        return -1;
+    }
+    buff[n] = '\0';
+    query = buff;
+    exec_cgi(cli_fd, path, query, "POST");
+    close(cli_fd);
     return 0;
 }
 
 int 
-exec_cgi(int cli_fd, const char *path, const char *query) {
-    ;
+exec_cgi(int cli_fd, const char *path, const char *query, 
+        const char *method) {
+    int  n;
+    char buff[4096];
+    pid_t pid;
+    int status;
+    int cgi_infd[2];
+    int cgi_outfd[2];
+
+    char method_env[64];
+    char length_env[64];
+    char query_env[1024];
+
+    if (pipe(cgi_infd) < 0 || pipe(cgi_outfd) < 0) {
+        cgi_exec_failed(cli_fd);
+        return -1;
+    }
+    if ((pid = fork()) < 0) {
+        cgi_exec_failed(cli_fd);
+        return -1;
+    }
+    /* 子进程执行cgi程序 */
+    if (0 == pid) {
+        close(cgi_infd[1]);
+        close(cgi_outfd[0]);
+        dup2(cgi_infd[0], 0);
+        dup2(cgi_outfd[1], 1);
+        snprintf(method_env, sizeof(method), "REQUEST_METHOD=%s", method);
+        putenv(method_env);
+        if (strcasecmp(method, "GET") == 0) {
+            snprintf(query_env, sizeof(query_env), "QUERY_STRING=%s", query);
+            putenv(query_env);
+        } else {
+            snprintf(length_env, sizeof(length_env), "CONTENT_LENGTH=%lu",
+                    strlen(query));
+            putenv(length_env);
+        }
+        execl(path, path, 0);
+        exit(0);
+    } else { /* 父进程，等待子进程退出*/
+        close(cgi_infd[0]);
+        close(cgi_outfd[1]);
+        n = write(cgi_infd[1], query, strlen(query));
+        n = read(cgi_outfd[0], buff, sizeof(buff));
+        send_headers(cli_fd);
+        if (n > 0) {
+            write(cli_fd, buff, n);
+        }
+        close(cgi_infd[1]);
+        close(cgi_outfd[0]);
+        waitpid(pid, &status, 0);
+    }
+
     return 0;
 }
 
@@ -118,25 +196,21 @@ exec_cgi(int cli_fd, const char *path, const char *query) {
  * User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36
  * Accept: application/json
  *
- *
  */
 int 
 handle_request(int cli_fd) {
-    char *query;
-    char *p;
     char method[128];
     char uri[512];
     char buff[4096];
     size_t  i,j;
     size_t  len = 0;
-    int  cgi = 0;
 
     /* 读出来第一行. */
     len = readline(cli_fd, buff, sizeof(buff));
+    // len = read(cli_fd, buff, sizeof(buff));
     if (len >= sizeof(buff)) {
         bad_client(cli_fd);
     }
-    printf("first line:\n%s\n", buff);
 
     /* 解析 method字段和URL字段 */
     i = 0;
@@ -145,23 +219,27 @@ handle_request(int cli_fd) {
         i++;
     }
     method[i] = '\0';
-    printf("method:%s\n", method);
+    /* 跳过 GET 后面的空白 */
     while ('\0' != buff[i] && isspace(buff[i])) {
         i++;
     }
+    /* 找到 url内容*/
     j = 0;
     while ('\0' != buff[i] && !isspace(buff[i]) && j < sizeof(uri)-1) {
-        uri[j++] = buff[i++];
+        uri[j++] = buff[i++]; 
     }
-    uri[j] = '\0';
-    printf("uri:%s\n", uri);
+    uri[j] = '\0'; /* url后面可能还有其他部分，截取掉。 */
     
     if (strcasecmp(method, "POST") == 0) {
         return handle_post(cli_fd, uri);
     } else if (strcasecmp(method, "GET") == 0) {
         return handle_get(cli_fd, uri);
+    } else if (strcasecmp(method, "HEAD") == 0) {
+        send_headers(cli_fd);
+        close(cli_fd);
     } else {
         undefined_method(cli_fd);
+        close(cli_fd);
         return 1;
     }
     return 0;
@@ -172,6 +250,19 @@ bad_client(int cli_fd) {
     fprintf(stderr, "bad client, close\n");
     close(cli_fd);
     return 0;
+}
+
+void bad_request(int cli_fd) {
+    char buff[1024];
+    size_t off = 0;
+	off += snprintf(buff+off, sizeof(buff)-off, "HTTP/1.0 400 BAD REQUEST\r\n");
+	off += snprintf(buff+off, sizeof(buff)-off, HTTP_SERVER);
+	off += snprintf(buff+off, sizeof(buff)-off, "Content-Type: text/html\r\n");
+	off += snprintf(buff+off, sizeof(buff)-off, "\r\n");
+	off += snprintf(buff+off, sizeof(buff)-off, "<P>Your browser sent a bad request,");
+	off += snprintf(buff+off, sizeof(buff)-off, "such as a POST without a Content-Length.\r\n,");
+	send(cli_fd, buff, off, 0);
+	return;
 }
 
 void 
@@ -188,7 +279,6 @@ undefined_method(int cli_fd) {
     off += snprintf(buff+off, sizeof(buff)-off, "<BODY><P>HTTP request method not supported.\r\n");
     off += snprintf(buff+off, sizeof(buff)-off, "</BODY></HTML>\r\n");
     send(cli_fd, buff, strlen(buff), 0);
-    close(cli_fd);
 }
 
 void 
@@ -251,7 +341,6 @@ int handle_get(int cli_fd, const char *uri) {
     char        path[512];
     char        buff[4096];
     int         cgi   = 0;
-    size_t      len   = 0;
     const char *query = NULL;
     const char *p     = uri;
     struct stat st;
@@ -273,10 +362,10 @@ int handle_get(int cli_fd, const char *uri) {
     printf("path:%s\n", path);
     stat(path, &st);
     if (S_ISDIR(st.st_mode)) {
-        snprintf(path, sizeof(path), "%s/index.html", uri);
+        strcat(path, "/index.html"); /* ? out of range */
         stat(path, &st);
     }
-    printf("rewrited uri:%s\n", uri);
+    printf("rewrited path:%s\n", path);
     /* 文件不存在 */
     if (access(path, F_OK) != 0) {
         discard_left(cli_fd, buff, sizeof(buff));
@@ -291,7 +380,7 @@ int handle_get(int cli_fd, const char *uri) {
     if (0 == cgi) {
         send_file(cli_fd, path);
     } else {
-        exec_cgi(cli_fd, path, query);
+        exec_cgi(cli_fd, path, query, "GET");
     }
     close(cli_fd);
     return 0;
@@ -308,4 +397,53 @@ discard_left(int cli_fd, char *buff, size_t size) {
         len = read(cli_fd, buff, size);
     } while (size == len);
     return 0; 
+}
+
+/*
+ * @brief： 非阻塞文件描述符，读出socket中buffered全部数据。
+ *
+ */
+int read_all(int sockfd, char *buff, size_t size) {
+    ssize_t len    = 0;
+    ssize_t offset = 0;
+    ssize_t total  = 0;
+    while (1) {
+        /* 数据量太大，原来已经读到buffer的字节放弃 */
+        if (offset >= (ssize_t)size) {
+            offset = 0;
+        }
+
+        len = read(sockfd, buff + offset, size - offset);
+        if (len == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                printf("recv finish detected, quit...\n");
+                break;
+            }
+        }
+        offset += len;
+        total  += len;
+    }
+    return total;
+}
+
+/*
+ * @brief： 返回http 500错误，只写给client http head，不返回body
+ *
+ */
+int 
+internal_server_error(int cli_fd) {
+    char buff[1024];
+    int off = 0;
+    int size = sizeof(buff);
+
+    off += snprintf(buff+off, size-off, "HTTP/1.0 500 Internal Server Error\r\n");
+    off += snprintf(buff+off, size-off, "Content-type: text/html\r\n");
+    off += snprintf(buff+off, size-off, "\r\n");
+    return write(cli_fd, buff, off);
+}
+
+int cgi_exec_failed(int cli_fd) {
+    char buff[256] = {"<P>Error prohibited CGI execution.\r\n"} ;
+    internal_server_error(cli_fd);
+    return write(cli_fd, buff, strlen(buff)); 
 }
