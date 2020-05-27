@@ -1,3 +1,7 @@
+/*
+ * @brief:主要参考<<The linux programming interface>>实现.
+ *        目的是通过动手实践理解http server的实现原理，和多进程的应用.
+ */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,6 +19,18 @@
 #include "util.h"
 
 #define HTTP_SERVER "Server: httpd 0.1.0\r\n"
+
+/*
+ * 实现的几个简单的http 状态码.
+ */
+enum {
+    STATUS_OK             = 200,
+    STATUS_MOVED          = 301,
+    STATUS_BAD_REQUEST    = 400,
+    STATUS_NOT_FOUND      = 404,
+    STATUS_INTERNAL_ERROR = 500,
+    STATUS_UNDEFINED_METHOD = 501
+};
 
 /*--------------------------------------------------------------------*/
 int serv_socket(uint16_t port);
@@ -55,6 +71,7 @@ main(int argc, char *argv[]) {
             perror("accept client connect error:");
             continue;
         }
+        // set_non_block(cli_fd);
         handle_request(cli_fd);
     }
     close(serv_fd);
@@ -101,6 +118,7 @@ int serv_socket(uint16_t port) {
  */
 int 
 handle_post(int cli_fd, const char *path) {
+    int err = 0;
     int n, length;
     char buff[4096];
     const char *query = NULL;
@@ -116,19 +134,16 @@ handle_post(int cli_fd, const char *path) {
     }
     if (n <= 0) {
         bad_request(cli_fd);
-        close(cli_fd);
-        return -1;
+        return STATUS_BAD_REQUEST;
     }
     n = read(cli_fd, buff, sizeof(buff));
     if (n < 0) {
-        close(cli_fd);
-        return -1;
+        return STATUS_BAD_REQUEST;
     }
     buff[n] = '\0';
     query = buff;
-    exec_cgi(cli_fd, path, query, "POST");
-    close(cli_fd);
-    return 0;
+    err = exec_cgi(cli_fd, path, query, "POST");
+    return (0 == err) ? STATUS_OK : STATUS_INTERNAL_ERROR;
 }
 
 int 
@@ -204,12 +219,15 @@ handle_request(int cli_fd) {
     char buff[4096];
     size_t  i,j;
     size_t  len = 0;
+    int     status = 200;
 
     /* 读出来第一行. */
     len = readline(cli_fd, buff, sizeof(buff));
     // len = read(cli_fd, buff, sizeof(buff));
     if (len >= sizeof(buff)) {
         bad_client(cli_fd);
+        close(cli_fd);
+        return -1;
     }
 
     /* 解析 method字段和URL字段 */
@@ -231,24 +249,23 @@ handle_request(int cli_fd) {
     uri[j] = '\0'; /* url后面可能还有其他部分，截取掉。 */
     
     if (strcasecmp(method, "POST") == 0) {
-        return handle_post(cli_fd, uri);
+        status = handle_post(cli_fd, uri);
     } else if (strcasecmp(method, "GET") == 0) {
-        return handle_get(cli_fd, uri);
+        status = handle_get(cli_fd, uri);
     } else if (strcasecmp(method, "HEAD") == 0) {
         send_headers(cli_fd);
-        close(cli_fd);
     } else {
         undefined_method(cli_fd);
-        close(cli_fd);
-        return 1;
+        status = STATUS_UNDEFINED_METHOD;
     }
+    close(cli_fd);
     return 0;
 }
 
 int 
 bad_client(int cli_fd) {
-    fprintf(stderr, "bad client, close\n");
-    close(cli_fd);
+    /* 可以输出对端的ip信息等 */
+    fprintf(stderr, "bad client fd=%d, close\n", cli_fd);
     return 0;
 }
 
@@ -261,7 +278,7 @@ void bad_request(int cli_fd) {
 	off += snprintf(buff+off, sizeof(buff)-off, "\r\n");
 	off += snprintf(buff+off, sizeof(buff)-off, "<P>Your browser sent a bad request,");
 	off += snprintf(buff+off, sizeof(buff)-off, "such as a POST without a Content-Length.\r\n,");
-	send(cli_fd, buff, off, 0);
+	write(cli_fd, buff, off);
 	return;
 }
 
@@ -278,7 +295,7 @@ undefined_method(int cli_fd) {
     off += snprintf(buff+off, sizeof(buff)-off, "</TITLE></HEAD>\r\n");
     off += snprintf(buff+off, sizeof(buff)-off, "<BODY><P>HTTP request method not supported.\r\n");
     off += snprintf(buff+off, sizeof(buff)-off, "</BODY></HTML>\r\n");
-    send(cli_fd, buff, strlen(buff), 0);
+    write(cli_fd, buff, strlen(buff));
 }
 
 void 
@@ -294,7 +311,7 @@ not_find(int cli_fd) {
 	off += snprintf(buff+off, sizeof(buff)-off, "your request because the resource specified\r\n");
 	off += snprintf(buff+off, sizeof(buff)-off, "is unavailable or nonexistent.\r\n");
 	off += snprintf(buff+off, sizeof(buff)-off, "</BODY></HTML>\r\n");
-	send(cli_fd, buff, strlen(buff), 0);
+	write(cli_fd, buff, strlen(buff));
     return;
 }
 
@@ -338,6 +355,7 @@ send_file(int cli_fd, const char *path) {
 }
 
 int handle_get(int cli_fd, const char *uri) {
+    int         err = 0;
     char        path[512];
     char        buff[4096];
     int         cgi   = 0;
@@ -371,19 +389,19 @@ int handle_get(int cli_fd, const char *uri) {
         discard_left(cli_fd, buff, sizeof(buff));
         fprintf(stderr, "can not find:%s\n", path);
         not_find(cli_fd);
-        close(cli_fd);
+        return 404;
     }
     if (st.st_mode & S_IXUSR || st.st_mode & S_IXGRP || st.st_mode & S_IXOTH) {
         cgi = 1;
     }
 
     if (0 == cgi) {
-        send_file(cli_fd, path);
+        err = send_file(cli_fd, path);
+        return (0 == err) ? STATUS_OK : STATUS_NOT_FOUND;
     } else {
-        exec_cgi(cli_fd, path, query, "GET");
+        err = exec_cgi(cli_fd, path, query, "GET");
+        return (0 == err) ? STATUS_OK : STATUS_INTERNAL_ERROR;
     }
-    close(cli_fd);
-    return 0;
 }
 
 /*
