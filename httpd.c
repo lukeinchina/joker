@@ -44,7 +44,6 @@ int cgi_exec_failed(int cli_fd);
 int send_headers(int cli_fd); /* http head: 200 */
 
 int read_all(int sockfd, char *buff, size_t size);
-int discard_left(int cli_fd, char *buff, size_t size);
 
 int send_file(int cli_fd, const char *path);
 int exec_cgi(int cli_fd, const char *path, const char *query, const char *method);
@@ -71,7 +70,7 @@ main(int argc, char *argv[]) {
             perror("accept client connect error:");
             continue;
         }
-        // set_non_block(cli_fd);
+        set_non_block(cli_fd);
         handle_request(cli_fd);
     }
     close(serv_fd);
@@ -218,13 +217,13 @@ handle_request(int cli_fd) {
     char uri[512];
     char buff[4096];
     size_t  i,j;
-    size_t  len = 0;
-    int     status = 200;
+    int  len = 0;
+    int  status = 200;
 
     /* 读出来第一行. */
     len = readline(cli_fd, buff, sizeof(buff));
     // len = read(cli_fd, buff, sizeof(buff));
-    if (len >= sizeof(buff)) {
+    if (len == (int)(sizeof(buff) - 1) || len < 0) {
         bad_client(cli_fd);
         close(cli_fd);
         return -1;
@@ -232,7 +231,7 @@ handle_request(int cli_fd) {
 
     /* 解析 method字段和URL字段 */
     i = 0;
-    while (!isspace(buff[i]) && i < len && i < sizeof(method) - 1) {
+    while (!isspace(buff[i]) && i < (size_t)len && i < sizeof(method) - 1) {
         method[i] = buff[i];
         i++;
     }
@@ -335,8 +334,6 @@ send_file(int cli_fd, const char *path) {
 	int n  = 1;
 	char buff[4096];
 
-    /* socket buffer里面内容读完。 */
-    discard_left(cli_fd, buff, sizeof(buff));
 
 	fp = fopen(path, "r");
     if (NULL == fp) {
@@ -386,16 +383,18 @@ int handle_get(int cli_fd, const char *uri) {
     printf("rewrited path:%s\n", path);
     /* 文件不存在 */
     if (access(path, F_OK) != 0) {
-        discard_left(cli_fd, buff, sizeof(buff));
+        read_all(cli_fd, buff, sizeof(buff));
         fprintf(stderr, "can not find:%s\n", path);
         not_find(cli_fd);
-        return 404;
+        return STATUS_NOT_FOUND;
     }
     if (st.st_mode & S_IXUSR || st.st_mode & S_IXGRP || st.st_mode & S_IXOTH) {
         cgi = 1;
     }
 
     if (0 == cgi) {
+        /* socket buffer里面内容读完。 */
+        read_all(cli_fd, buff, sizeof(buff));
         err = send_file(cli_fd, path);
         return (0 == err) ? STATUS_OK : STATUS_NOT_FOUND;
     } else {
@@ -405,29 +404,16 @@ int handle_get(int cli_fd, const char *uri) {
 }
 
 /*
- * @brief:读出socket中的内容，丢弃.
- * @return : succ:0, failed: -1
- */
-int 
-discard_left(int cli_fd, char *buff, size_t size) {
-    size_t len = 0;
-    do {
-        len = read(cli_fd, buff, size);
-    } while (size == len);
-    return 0; 
-}
-
-/*
  * @brief： 非阻塞文件描述符，读出socket中buffered全部数据。
  *
  */
 int read_all(int sockfd, char *buff, size_t size) {
-    ssize_t len    = 0;
-    ssize_t offset = 0;
-    ssize_t total  = 0;
+    int len    = 0;
+    int offset = 0;
+    int total  = 0;
     while (1) {
         /* 数据量太大，原来已经读到buffer的字节放弃 */
-        if (offset >= (ssize_t)size) {
+        if (offset >= (int)size) {
             offset = 0;
         }
 
